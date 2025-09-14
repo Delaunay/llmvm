@@ -271,7 +271,6 @@ class NewMiniLlama(nn.Module):
     def __init__(self, dim: int = 64, n_layers: int = 4, n_heads: int = 8):
         super().__init__()
         self.dim = dim
-        self.vocab_size = vocab_size
 
         # Transformer layers
         hidden_dim = dim * 4  # Standard 4x expansion in FFN
@@ -294,12 +293,7 @@ class NewMiniLlama(nn.Module):
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids):
-        # Convert our packed integers to token IDs (use modulo to fit vocab)
-        token_ids = input_ids % self.vocab_size
-
-        x = self.embed_tokens(token_ids)
-
+    def forward(self, x):
         for layer in self.layers:
             x = layer(x)
 
@@ -393,7 +387,7 @@ class NewMiniLlama(nn.Module):
 # Global model instances
 VOCAB_SIZE = 1000  # Enough to cover our packed integers
 model = TradMiniLlama(vocab_size=VOCAB_SIZE, dim=VECTOR_SIZE, n_layers=2, n_heads=4)
-new_model = NewMiniLlama(vocab_size=VOCAB_SIZE, dim=VECTOR_SIZE, n_layers=2, n_heads=4)
+new_model = NewMiniLlama(dim=VECTOR_SIZE, n_layers=16, n_heads=8)
 
 
 def new_llm(encoded_sentence):
@@ -404,8 +398,9 @@ def new_llm(encoded_sentence):
     new_model.eval()
 
     with torch.no_grad():
-        # Convert to tensor and add batch dimension
-        input_tensor = torch.tensor(encoded_sentence, dtype=torch.long).unsqueeze(0)
+        # Convert encoded integers to 64D vectors
+        input_vectors = integers_to_vectors(encoded_sentence)  # [seq_len, 64]
+        input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
 
         # Sample from the multivariate Gaussian distribution
         sampled_integers = new_model.sample_vector_as_integer(input_tensor)
@@ -414,7 +409,24 @@ def new_llm(encoded_sentence):
         return sampled_integers[0][-1]  # Last position of first batch
 
 
-def train_new_llm_on_math(num_epochs=100, lr=0.001):
+def integers_to_vectors(encoded_integers):
+    """
+    Convert a list of encoded integers to 64-dimensional vectors.
+    Each integer is converted to its 64-bit binary representation.
+    """
+    vectors = []
+    for integer in encoded_integers:
+        # Convert integer to 64-bit binary representation
+        bits = split_bits(integer, VECTOR_SIZE)
+        # Convert bits to float tensor
+        vector = torch.tensor(bits, dtype=torch.float32)
+        vectors.append(vector)
+
+    # Stack into tensor [seq_len, 64]
+    return torch.stack(vectors)
+
+
+def train_new_llm_on_math(num_epochs=100, lr=0.0001):
     """
     Train the new LLM with multivariate Gaussian output using negative log-likelihood.
     """
@@ -425,7 +437,9 @@ def train_new_llm_on_math(num_epochs=100, lr=0.001):
 
     new_model.train()
 
-    for epoch in range(num_epochs):
+    epoch = 0
+    for i in range(num_epochs):
+        epoch += 1
         total_loss = 0
 
         for expr in training_expressions:
@@ -437,13 +451,23 @@ def train_new_llm_on_math(num_epochs=100, lr=0.001):
             # Convert target to bit representation as continuous values
             target_bits = torch.tensor(split_bits(target_encoded, VECTOR_SIZE), dtype=torch.float32)
 
-            # Prepare input tensor
-            input_tensor = torch.tensor(encoded_input, dtype=torch.long).unsqueeze(0)
+            # Convert encoded integers to 64D vectors
+            input_vectors = integers_to_vectors(encoded_input)  # [seq_len, 64]
+            input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
 
             # Forward pass - get mu and sigma
             mu, sigma = new_model(input_tensor)  # [1, seq_len, 64]
             last_mu = mu[0, -1, :]      # [64] - last position mean
             last_sigma = sigma[0, -1, :] # [64] - last position std
+
+            prediction = (last_mu > 0.5).long()
+            target_bits
+
+            def get_number(array):
+                tag, v = unpack(join_bits(array.long().tolist()))
+                return v
+
+            #  print(get_number(prediction), get_number(target_bits))
 
             # Compute negative log-likelihood loss for multivariate Gaussian
             # -log p(x|mu,sigma) = 0.5 * sum((x-mu)^2/sigma^2 + log(2*pi*sigma^2))
@@ -454,10 +478,9 @@ def train_new_llm_on_math(num_epochs=100, lr=0.001):
             )
 
             # Alternative: Use MSE loss on the mean
-            # mse_loss = F.mse_loss(last_mu, target_bits)
+           #  mse_loss = F.mse_loss(last_mu, target_bits)
 
             loss = nll_loss
-
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
@@ -469,7 +492,11 @@ def train_new_llm_on_math(num_epochs=100, lr=0.001):
             avg_loss = total_loss / len(training_expressions)
             print(f"Epoch {epoch}, Average Loss: {avg_loss:.4f}")
 
+        if (p := get_number(prediction)) == (t := get_number(target_bits)):
+            print(p, t)
+            return
     print("New LLM (Gaussian) training completed!")
+
 
 
 # Example usage:
@@ -670,6 +697,26 @@ for i in range(10):
     pyr = eval(expr)
 
     print(f"{expr:<50} = {result:3d} | {pyr:3d}")
+
+
+
+train_new_llm_on_math()
+
+
+
+for i in range(10):
+    if i > 10:
+        break
+
+    expr = generate(seed=i)
+    encoded = encoder(expr)
+    result = vm(encoded)
+    pyr = eval(expr)
+    new_llm_result = new_llm(encoded)
+
+    v1, v2 = unpack(new_llm_result)
+
+    print(f"{expr:<50} = {result:3d} | {pyr:3d} | new_llm: {v1:3d} {v2}")
 
 
 
