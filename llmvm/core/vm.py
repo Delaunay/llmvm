@@ -222,49 +222,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class TradMiniLlama(nn.Module):
-    def __init__(self, vocab_size: int, dim: int = 64, n_layers: int = 4, n_heads: int = 8):
-        super().__init__()
-        self.dim = dim
-        self.vocab_size = vocab_size
-
-        # Token embeddings - map from our encoded values to embedding space
-        self.embed_tokens = nn.Embedding(vocab_size, dim)
-
-        # Transformer layers
-        hidden_dim = dim * 4  # Standard 4x expansion in FFN
-        self.layers = nn.ModuleList([
-            TransformerBlock(dim, n_heads, hidden_dim) for _ in range(n_layers)
-        ])
-
-        self.norm = RMSNorm(dim)
-
-        # Output projection to vocabulary
-        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, input_ids):
-        # Convert our packed integers to token IDs (use modulo to fit vocab)
-        token_ids = input_ids % self.vocab_size
-
-        x = self.embed_tokens(token_ids)
-
-        for layer in self.layers:
-            x = layer(x)
-
-        x = self.norm(x)
-        logits = self.lm_head(x)
-
-        # [batch_size, seq_len, vocab_size] This is like probability of the next word
-        return logits
 
 
 class NewMiniLlama(nn.Module):
@@ -426,61 +383,57 @@ def integers_to_vectors(encoded_integers):
     return torch.stack(vectors)
 
 
-def train_new_llm_on_math(num_epochs=100, lr=0.0001):
+def train_new_llm_two_phase(phase1_epochs=50, phase2_epochs=100, lr=0.0001):
     """
-    Train the new LLM with multivariate Gaussian output using negative log-likelihood.
+    Two-phase training for the new LLM:
+    Phase 1: Learn to reproduce/reconstruct the input sequence (autoencoder behavior)
+    Phase 2: Learn to complete the sequence with the correct mathematical result
     """
     optimizer = torch.optim.AdamW(new_model.parameters(), lr=lr)
 
     # Generate training data
     training_expressions = [generate(seed=i) for i in range(20)]
 
+    print("=== PHASE 1: Learning Input Reconstruction ===")
     new_model.train()
 
-    epoch = 0
-    for i in range(num_epochs):
-        epoch += 1
+    # Phase 1: Input reconstruction
+    for epoch in range(phase1_epochs):
         total_loss = 0
 
         for expr in training_expressions:
-            # Encode input and get target
+
             encoded_input = encoder(expr)
             target_value = vm(encoded_input)
-            target_encoded = pack(NUMBER, target_value)
 
-            # Convert target to bit representation as continuous values
-            target_bits = torch.tensor(split_bits(target_encoded, VECTOR_SIZE), dtype=torch.float32)
+            full_expr = f"{expr} = {target_value}"
+            encoded_input = encoder(full_expr)
+            # print(full_expr)
 
-            # Convert encoded integers to 64D vectors
+            # Convert to 64D vectors
             input_vectors = integers_to_vectors(encoded_input)  # [seq_len, 64]
             input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
 
-            # Forward pass - get mu and sigma
+            # Forward pass
             mu, sigma = new_model(input_tensor)  # [1, seq_len, 64]
-            last_mu = mu[0, -1, :]      # [64] - last position mean
-            last_sigma = sigma[0, -1, :] # [64] - last position std
 
-            prediction = (last_mu > 0.5).long()
-            target_bits
+            # For each position, try to reconstruct the input at that position
+            position_losses = []
+            for pos in range(len(encoded_input)):
+                # Target: the input vector at this position
+                target_bits = input_vectors[pos]  # [64]
 
-            def get_number(array):
-                tag, v = unpack(join_bits(array.long().tolist()))
-                return v
+                # Prediction: mu at this position
+                pred_mu = mu[0, pos, :]  # [64]
+                pred_sigma = sigma[0, pos, :]  # [64]
 
-            #  print(get_number(prediction), get_number(target_bits))
+                # MSE loss for reconstruction (simpler than NLL for phase 1)
+                reconstruction_loss = F.mse_loss(pred_mu, target_bits)
+                position_losses.append(reconstruction_loss)
 
-            # Compute negative log-likelihood loss for multivariate Gaussian
-            # -log p(x|mu,sigma) = 0.5 * sum((x-mu)^2/sigma^2 + log(2*pi*sigma^2))
-            diff = target_bits - last_mu
-            nll_loss = 0.5 * torch.sum(
-                (diff ** 2) / (last_sigma ** 2) +
-                torch.log(2 * math.pi * last_sigma ** 2)
-            )
+            # Average loss across all positions
+            loss = torch.stack(position_losses).mean()
 
-            # Alternative: Use MSE loss on the mean
-           #  mse_loss = F.mse_loss(last_mu, target_bits)
-
-            loss = nll_loss
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
@@ -488,33 +441,85 @@ def train_new_llm_on_math(num_epochs=100, lr=0.0001):
 
             total_loss += loss.item()
 
-        if epoch % 20 == 0:
+        if epoch % 10 == 0:
             avg_loss = total_loss / len(training_expressions)
-            print(f"Epoch {epoch}, Average Loss: {avg_loss:.4f}")
+            print(f"Phase 1 - Epoch {epoch}, Reconstruction Loss: {avg_loss:.4f}")
 
-        if (p := get_number(prediction)) == (t := get_number(target_bits)):
-            print(p, t)
-            return
-    print("New LLM (Gaussian) training completed!")
+    print("Phase 1 completed! Model can now reconstruct inputs.")
+
+    print("\n=== PHASE 2: Learning Mathematical Completion ===")
+
+    # Phase 2: Mathematical completion
+    for epoch in range(phase2_epochs):
+        total_loss = 0
+        correct_predictions = 0
+        total_predictions = 0
+
+        for expr in training_expressions:
+            encoded_input = encoder(expr)
+            target_value = vm(encoded_input)
+            target_encoded = pack(NUMBER, target_value)
+            target_bits = torch.tensor(split_bits(target_encoded, VECTOR_SIZE), dtype=torch.float32)
+
+            # Convert to 64D vectors
+            input_vectors = integers_to_vectors(encoded_input)  # [seq_len, 64]
+            input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
+
+            # Forward pass
+            mu, sigma = new_model(input_tensor)  # [1, seq_len, 64]
+
+            # Only train on the last position (the completion)
+            last_mu = mu[0, -1, :]      # [64] - last position mean
+            last_sigma = sigma[0, -1, :] # [64] - last position std
+
+            # Check prediction accuracy
+            prediction = (last_mu > 0.5).long()
+
+            def get_number(array):
+                try:
+                    tag, v = unpack(join_bits(array.long().tolist()))
+                    return v
+                except:
+                    return -1
+
+            pred_num = get_number(prediction)
+            target_num = get_number(target_bits)
+
+            if pred_num == target_num:
+                correct_predictions += 1
+            total_predictions += 1
+
+            # Compute negative log-likelihood loss for the completion
+            diff = target_bits - last_mu
+            nll_loss = 0.5 * torch.sum(
+                (diff ** 2) / (last_sigma ** 2) +
+                torch.log(2 * math.pi * last_sigma ** 2)
+            )
+
+            loss = nll_loss
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        if epoch % 10 == 0:
+            avg_loss = total_loss / len(training_expressions)
+            accuracy = correct_predictions / total_predictions * 100
+            print(f"Phase 2 - Epoch {epoch}, Completion Loss: {avg_loss:.4f}, Accuracy: {accuracy:.1f}%")
+
+        # Early stopping if we achieve good accuracy
+        if correct_predictions / total_predictions > 0.9:
+            print(f"Early stopping! Achieved {correct_predictions/total_predictions*100:.1f}% accuracy")
+            break
+
+    print("Phase 2 completed! Model can now perform mathematical completion.")
+    return new_model
 
 
 
-# Example usage:
-# print("Training the new LLM with multivariate Gaussian sampling...")
-# train_new_llm_on_math()
-
-# Test the new model
-# test_expr = "2 + 3"
-# encoded_test = encoder(test_expr)
-# result = new_llm(encoded_test)
-# print(f"New LLM (Gaussian) result for '{test_expr}': {result}")
-# print(f"Decoded result: {decode(result)}")
-
-# You can also inspect the learned distributions:
-# with torch.no_grad():
-#     mu, sigma = new_model(torch.tensor(encoded_test).unsqueeze(0))
-#     print(f"Learned mu: {mu[0, -1, :5]}")      # First 5 dimensions
-#     print(f"Learned sigma: {sigma[0, -1, :5]}")  # First 5 dimensions
 
 
 def vm(encoded_sentence):
@@ -593,65 +598,8 @@ def vm(encoded_sentence):
     return evaluate_postfix(postfix_tokens)
 
 
-print(encoder("1 + 2"))
-print(decoder(encoder("1 + 2")))
 
-assert vm(encoder("1 + 2")) == 3
-assert vm(encoder("( 1 + 2 ) * 3")) == 9
-
-
-def llm(encoded_sentence):
-    """
-    LLM-based computation using a mini Llama transformer.
-    This simulates how a real LLM would process mathematical expressions.
-    """
-    model.eval()  # Set to evaluation mode
-
-    with torch.no_grad():
-        # Convert to tensor and add batch dimension
-        input_tensor = torch.tensor(encoded_sentence, dtype=torch.long).unsqueeze(0)
-
-        # Forward pass through the transformer
-        logits = model(input_tensor)
-
-        # For mathematical computation, we want the model to predict the result
-        # We'll use the last token's logits to predict the answer
-        last_logits = logits[0, -1, :]  # Shape: [vocab_size]
-
-        # Convert logits back to our encoding space
-        # We'll use a simple approach: find the token that represents our answer
-
-        # For now, let's use the VM as ground truth to "train" our intuition
-        # In a real scenario, this would be learned from training data
-        try:
-            # Get the correct answer using our VM
-            correct_answer = vm(encoded_sentence)
-
-            # Encode the answer
-            answer_encoded = pack(NUMBER, correct_answer)
-
-            # Map to vocab space
-            answer_token = answer_encoded % VOCAB_SIZE
-
-            # For demonstration, we'll return the correct answer
-            # In practice, you'd sample from the logits or take argmax
-            return answer_encoded
-
-        except Exception:
-            # Fallback: sample from the model's predictions
-            probs = F.softmax(last_logits, dim=-1)
-            predicted_token = torch.multinomial(probs, 1).item()
-
-            # Convert back to our encoding (this is a simplified mapping)
-            # In practice, you'd need a proper vocabulary mapping
-            predicted_value = predicted_token % (2**DATA_SIZE)
-            return pack(NUMBER, predicted_value)
-
-
-
-
-
-def generate(depht_limit=3, max_number=10, operators=["+", "*"], seed=0):
+def generate(depht_limit=2, max_number=10, operators=["+"], seed=0):
     """Infinite example generator"""
     import random
 
@@ -668,7 +616,7 @@ def generate(depht_limit=3, max_number=10, operators=["+", "*"], seed=0):
 
         selection = prng.choices(
             ["bin", "parens", "number"],
-            [0.7, 0.2, 0.1]
+            [0.7, 0.0, 0.1]
         )
 
         match selection[0]:
@@ -700,8 +648,7 @@ for i in range(10):
 
 
 
-train_new_llm_on_math()
-
+train_new_llm_two_phase()
 
 
 for i in range(10):
@@ -719,61 +666,3 @@ for i in range(10):
     print(f"{expr:<50} = {result:3d} | {pyr:3d} | new_llm: {v1:3d} {v2}")
 
 
-
-# assert decoder(llm(encoder("1 + 2"))) == 3
-# assert decoder(llm(encoder("( 1 + 2 ) * 3"))) == 9
-
-
-def train_llm_on_math(num_epochs=100, lr=0.001):
-    """
-    Train the LLM to perform mathematical computations.
-    This demonstrates how an LLM learns to do math through examples.
-    """
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-
-    # Generate training data
-    training_expressions = [
-        generate(seed=i) for i in range(10)
-    ]
-
-    model.train()
-
-    for epoch in range(num_epochs):
-        total_loss = 0
-
-        for expr in training_expressions:
-            # Encode input and get target
-            encoded_input = encoder(expr)
-            target_value = vm(encoded_input)
-            target_encoded = pack(NUMBER, target_value)
-            target_token = target_encoded % VOCAB_SIZE
-
-            # Prepare input and target tensors
-            input_tensor = torch.tensor(encoded_input, dtype=torch.long).unsqueeze(0)
-            target_tensor = torch.tensor([target_token], dtype=torch.long)
-
-            # Forward pass
-            logits = model(input_tensor)
-            last_logits = logits[0, -1, :].unsqueeze(0)  # [1, vocab_size]
-
-            # Compute loss
-            loss = criterion(last_logits, target_tensor)
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        if epoch % 20 == 0:
-            avg_loss = total_loss / len(training_expressions)
-            print(f"Epoch {epoch}, Average Loss: {avg_loss:.4f}")
-
-    print("Training completed!")
-
-
-# Uncomment to train the model
-# print("Training the LLM on mathematical expressions...")
-# train_llm_on_math()
