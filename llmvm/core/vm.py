@@ -3,9 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-VECTOR_SIZE = 64
+
 TAG_SIZE = 8
-DATA_SIZE = VECTOR_SIZE - TAG_SIZE
+DATA_SIZE = 56
+VECTOR_SIZE = TAG_SIZE + DATA_SIZE
 
 VALUE_MASK = (1 << DATA_SIZE) - 1
 TAG_MASK = (1 << TAG_SIZE) - 1
@@ -15,9 +16,7 @@ TAG_MASK = (1 << TAG_SIZE) - 1
 # Order of operation
 #
 #
-TOKENS = (
-    "+", "-", "*", "/", "(", ")", "^", "&", "|"
-)
+TOKENS = ("+", "-", "*", "/", "(", ")", "^", "&", "|")
 
 
 def unpack(value: int) -> tuple[int, int]:
@@ -30,8 +29,8 @@ def unpack(value: int) -> tuple[int, int]:
 
 def pack(op: int, value: int, strict: bool = True):
     if strict:
-        assert (0 <= op < 2**TAG_SIZE)
-        assert (0 <= value < 2**DATA_SIZE)
+        assert 0 <= op < 2**TAG_SIZE
+        assert 0 <= value < 2**DATA_SIZE, f"{value} < {2**DATA_SIZE}"
 
     return (op << DATA_SIZE) | (value & VALUE_MASK)
 
@@ -83,9 +82,7 @@ EMBEDDINGS = {
     "=": pack(OPERAND, 10),
 }
 
-FROM_EMBEDDINGS = {
-    v: k for k, v in EMBEDDINGS.items()
-}
+FROM_EMBEDDINGS = {v: k for k, v in EMBEDDINGS.items()}
 
 
 def encode(word):
@@ -96,7 +93,7 @@ def encode(word):
 
 
 def encoder(sentence):
-    words = sentence.split(" ")
+    words = filter(lambda x: x != "", sentence.split(" "))
 
     return [encode(word) for word in words]
 
@@ -115,6 +112,7 @@ def decoder(encoded_sentence):
         frags.append(decode(embedding))
     return " ".join(frags)
 
+
 # Simplified Llama-style Transformer Model
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -131,14 +129,14 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer("inv_freq", inv_freq)
 
         # Pre-compute rotary embeddings
         t = torch.arange(max_seq_len).type_as(self.inv_freq)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer('cos_cached', emb.cos())
-        self.register_buffer('sin_cached', emb.sin())
+        self.register_buffer("cos_cached", emb.cos())
+        self.register_buffer("sin_cached", emb.sin())
 
     def forward(self, x, seq_len=None):
         if seq_len is None:
@@ -148,7 +146,7 @@ class RotaryEmbedding(nn.Module):
 
 def apply_rotary_pos_emb(q, k, cos, sin):
     def rotate_half(x):
-        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -173,9 +171,21 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
 
-        q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(x)
+            .view(batch_size, seq_len, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(x)
+            .view(batch_size, seq_len, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(x)
+            .view(batch_size, seq_len, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         cos, sin = self.rotary_emb(x, seq_len)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -183,9 +193,11 @@ class MultiHeadAttention(nn.Module):
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # Causal mask
-        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
-        scores.masked_fill_(mask, float('-inf'))
+        # Causal mask - create on the same device as the input
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=x.device), diagonal=1
+        ).bool()
+        scores.masked_fill_(mask, float("-inf"))
 
         attn_weights = F.softmax(scores, dim=-1)
         out = torch.matmul(attn_weights, v)
@@ -222,8 +234,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-
-
 class NewMiniLlama(nn.Module):
     def __init__(self, dim: int = 64, n_layers: int = 4, n_heads: int = 8):
         super().__init__()
@@ -231,15 +241,17 @@ class NewMiniLlama(nn.Module):
 
         # Transformer layers
         hidden_dim = dim * 4  # Standard 4x expansion in FFN
-        self.layers = nn.ModuleList([
-            TransformerBlock(dim, n_heads, hidden_dim) for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [TransformerBlock(dim, n_heads, hidden_dim) for _ in range(n_layers)]
+        )
 
         self.norm = RMSNorm(dim)
 
         # Output projection to mu and sigma for 64-dimensional Gaussian
-        self.mu_head = nn.Linear(dim, VECTOR_SIZE, bias=False)      # Mean parameters
-        self.sigma_head = nn.Linear(dim, VECTOR_SIZE, bias=False)   # Log-variance parameters
+        self.mu_head = nn.Linear(dim, VECTOR_SIZE, bias=False)  # Mean parameters
+        self.sigma_head = nn.Linear(
+            dim, VECTOR_SIZE, bias=False
+        )  # Log-variance parameters
 
         self._init_weights()
 
@@ -257,9 +269,9 @@ class NewMiniLlama(nn.Module):
         x = self.norm(x)
 
         # Output mu and log_sigma for Gaussian distribution
-        mu = self.mu_head(x)                    # [batch_size, seq_len, 64]
-        log_sigma = self.sigma_head(x)          # [batch_size, seq_len, 64]
-        sigma = torch.exp(log_sigma)            # [batch_size, seq_len, 64]
+        mu = self.mu_head(x)  # [batch_size, seq_len, 64]
+        log_sigma = self.sigma_head(x)  # [batch_size, seq_len, 64]
+        sigma = torch.exp(log_sigma)  # [batch_size, seq_len, 64]
 
         return mu, sigma
 
@@ -342,9 +354,14 @@ class NewMiniLlama(nn.Module):
 
 
 # Global model instances
-VOCAB_SIZE = 1000  # Enough to cover our packed integers
-model = TradMiniLlama(vocab_size=VOCAB_SIZE, dim=VECTOR_SIZE, n_layers=2, n_heads=4)
-new_model = NewMiniLlama(dim=VECTOR_SIZE, n_layers=16, n_heads=8)
+# VOCAB_SIZE = 1000  # Enough to cover our packed integers
+# model = TradMiniLlama(vocab_size=VOCAB_SIZE, dim=VECTOR_SIZE, n_layers=2, n_heads=4)
+
+# Device detection for GPU support
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+new_model = NewMiniLlama(dim=VECTOR_SIZE, n_layers=16, n_heads=8).to(device)
 
 
 def new_llm(encoded_sentence):
@@ -356,7 +373,9 @@ def new_llm(encoded_sentence):
 
     with torch.no_grad():
         # Convert encoded integers to 64D vectors
-        input_vectors = integers_to_vectors(encoded_sentence)  # [seq_len, 64]
+        input_vectors = integers_to_vectors(
+            encoded_sentence
+        )  # [seq_len, 64] - already on device
         input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
 
         # Sample from the multivariate Gaussian distribution
@@ -375,8 +394,8 @@ def integers_to_vectors(encoded_integers):
     for integer in encoded_integers:
         # Convert integer to 64-bit binary representation
         bits = split_bits(integer, VECTOR_SIZE)
-        # Convert bits to float tensor
-        vector = torch.tensor(bits, dtype=torch.float32)
+        # Convert bits to float tensor and move to device
+        vector = torch.tensor(bits, dtype=torch.float32, device=device)
         vectors.append(vector)
 
     # Stack into tensor [seq_len, 64]
@@ -391,135 +410,136 @@ def train_new_llm_two_phase(phase1_epochs=50, phase2_epochs=100, lr=0.0001):
     """
     optimizer = torch.optim.AdamW(new_model.parameters(), lr=lr)
 
-    # Generate training data
-    training_expressions = [generate(seed=i) for i in range(20)]
-
     print("=== PHASE 1: Learning Input Reconstruction ===")
     new_model.train()
+
+    bs = 1024
+    loader = Dataloader(
+        dataset=GeneratedDataset(kind="reproduce"),
+        batch_size=bs,
+    )
 
     # Phase 1: Input reconstruction
     for epoch in range(phase1_epochs):
         total_loss = 0
+        num_batches = 0
 
-        for expr in training_expressions:
+        for input_batch, target_batch in loader:
+            # input_batch: [batch_size, max_seq_len, VECTOR_SIZE]
+            # target_batch: [batch_size, VECTOR_SIZE] (not used in phase 1)
 
-            encoded_input = encoder(expr)
-            target_value = vm(encoded_input)
-
-            full_expr = f"{expr} = {target_value}"
-            encoded_input = encoder(full_expr)
-            # print(full_expr)
-
-            # Convert to 64D vectors
-            input_vectors = integers_to_vectors(encoded_input)  # [seq_len, 64]
-            input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
+            batch_size, seq_len, _ = input_batch.shape
 
             # Forward pass
-            mu, sigma = new_model(input_tensor)  # [1, seq_len, 64]
+            mu, sigma = new_model(input_batch)  # [batch_size, seq_len, VECTOR_SIZE]
 
-            # For each position, try to reconstruct the input at that position
-            position_losses = []
-            for pos in range(len(encoded_input)):
-                # Target: the input vector at this position
-                target_bits = input_vectors[pos]  # [64]
-
-                # Prediction: mu at this position
-                pred_mu = mu[0, pos, :]  # [64]
-                pred_sigma = sigma[0, pos, :]  # [64]
-
-                # MSE loss for reconstruction (simpler than NLL for phase 1)
-                reconstruction_loss = F.mse_loss(pred_mu, target_bits)
-                position_losses.append(reconstruction_loss)
-
-            # Average loss across all positions
-            loss = torch.stack(position_losses).mean()
+            # For reconstruction, we want to predict each position from the input
+            # Calculate loss for all positions and all examples in the batch
+            reconstruction_loss = F.mse_loss(mu, input_batch)
 
             # Backward pass
             optimizer.zero_grad()
-            loss.backward()
+            reconstruction_loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += reconstruction_loss.item()
+            num_batches += 1
 
         if epoch % 10 == 0:
-            avg_loss = total_loss / len(training_expressions)
+            avg_loss = total_loss / num_batches
             print(f"Phase 1 - Epoch {epoch}, Reconstruction Loss: {avg_loss:.4f}")
 
     print("Phase 1 completed! Model can now reconstruct inputs.")
 
     print("\n=== PHASE 2: Learning Mathematical Completion ===")
 
+    loader = Dataloader(
+        dataset=GeneratedDataset(kind="complete"),
+        batch_size=bs,
+    )
+
     # Phase 2: Mathematical completion
     for epoch in range(phase2_epochs):
         total_loss = 0
         correct_predictions = 0
         total_predictions = 0
+        num_batches = 0
 
-        for expr in training_expressions:
-            encoded_input = encoder(expr)
-            target_value = vm(encoded_input)
-            target_encoded = pack(NUMBER, target_value)
-            target_bits = torch.tensor(split_bits(target_encoded, VECTOR_SIZE), dtype=torch.float32)
+        for input_batch, target_batch in loader:
+            # input_batch: [batch_size, max_seq_len, VECTOR_SIZE]
+            # target_batch: [batch_size, VECTOR_SIZE]
 
-            # Convert to 64D vectors
-            input_vectors = integers_to_vectors(encoded_input)  # [seq_len, 64]
-            input_tensor = input_vectors.unsqueeze(0)  # [1, seq_len, 64]
+            batch_size, seq_len, _ = input_batch.shape
 
             # Forward pass
-            mu, sigma = new_model(input_tensor)  # [1, seq_len, 64]
+            mu, sigma = new_model(input_batch)  # [batch_size, seq_len, VECTOR_SIZE]
 
             # Only train on the last position (the completion)
-            last_mu = mu[0, -1, :]      # [64] - last position mean
-            last_sigma = sigma[0, -1, :] # [64] - last position std
+            last_mu = mu[:, -1, :]  # [batch_size, VECTOR_SIZE] - last position mean
+            last_sigma = sigma[
+                :, -1, :
+            ]  # [batch_size, VECTOR_SIZE] - last position std
 
-            # Check prediction accuracy
-            prediction = (last_mu > 0.5).long()
+            # Sample from the multivariate Gaussian using reparameterization trick
+            eps = torch.randn_like(last_mu)  # Standard normal noise
+            samples = last_mu + last_sigma * eps  # [batch_size, VECTOR_SIZE]
 
-            def get_number(array):
-                try:
-                    tag, v = unpack(join_bits(array.long().tolist()))
-                    return v
-                except:
-                    return -1
+            # Convert continuous samples to bits using sigmoid + threshold
+            bit_probs = torch.sigmoid(samples)
+            predictions = (bit_probs > 0.5).long()  # [batch_size, VECTOR_SIZE]
 
-            pred_num = get_number(prediction)
-            target_num = get_number(target_bits)
+            def get_number_batch(array_batch):
+                results = []
+                for i in range(array_batch.shape[0]):
+                    try:
+                        tag, v = unpack(join_bits(array_batch[i].long().tolist()))
+                        results.append(v)
+                    except:
+                        results.append(-1)
+                return results
 
-            if pred_num == target_num:
-                correct_predictions += 1
-            total_predictions += 1
+            pred_nums = get_number_batch(predictions)
+            target_nums = get_number_batch(target_batch)
+
+            # Count correct predictions
+            batch_correct = sum(1 for p, t in zip(pred_nums, target_nums) if p == t)
+            correct_predictions += batch_correct
+            total_predictions += batch_size
 
             # Compute negative log-likelihood loss for the completion
-            diff = target_bits - last_mu
-            nll_loss = 0.5 * torch.sum(
-                (diff ** 2) / (last_sigma ** 2) +
-                torch.log(2 * math.pi * last_sigma ** 2)
+            diff = target_batch - last_mu  # [batch_size, VECTOR_SIZE]
+            nll_loss = 0.5 * torch.mean(
+                torch.sum(
+                    (diff**2) / (last_sigma**2)
+                    + torch.log(2 * math.pi * last_sigma**2),
+                    dim=1,
+                )
             )
-
-            loss = nll_loss
 
             # Backward pass
             optimizer.zero_grad()
-            loss.backward()
+            nll_loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += nll_loss.item()
+            num_batches += 1
 
         if epoch % 10 == 0:
-            avg_loss = total_loss / len(training_expressions)
+            avg_loss = total_loss / num_batches
             accuracy = correct_predictions / total_predictions * 100
-            print(f"Phase 2 - Epoch {epoch}, Completion Loss: {avg_loss:.4f}, Accuracy: {accuracy:.1f}%")
+            print(
+                f"Phase 2 - Epoch {epoch}, Completion Loss: {avg_loss:.4f}, Accuracy: {accuracy:.1f}%"
+            )
 
         # Early stopping if we achieve good accuracy
         if correct_predictions / total_predictions > 0.9:
-            print(f"Early stopping! Achieved {correct_predictions/total_predictions*100:.1f}% accuracy")
+            print(
+                f"Early stopping! Achieved {correct_predictions/total_predictions*100:.1f}% accuracy"
+            )
             break
 
     print("Phase 2 completed! Model can now perform mathematical completion.")
     return new_model
-
-
-
 
 
 def vm(encoded_sentence):
@@ -545,9 +565,12 @@ def vm(encoded_sentence):
                     if operators:  # Remove the (
                         operators.pop()
                 else:  # Regular operator
-                    while (operators and
-                           unpack(operators[-1])[1] != 5 and
-                           precedence.get(unpack(operators[-1])[1], 0) >= precedence.get(value, 0)):
+                    while (
+                        operators
+                        and unpack(operators[-1])[1] != 5
+                        and precedence.get(unpack(operators[-1])[1], 0)
+                        >= precedence.get(value, 0)
+                    ):
                         output.append(operators.pop())
                     operators.append(token)
 
@@ -581,7 +604,7 @@ def vm(encoded_sentence):
                 elif value == 4:  # /
                     result = a // b
                 elif value == 7:  # ^
-                    result = a ** b
+                    result = a**b
                 elif value == 8:  # &
                     result = a & b
                 elif value == 9:  # |
@@ -598,26 +621,23 @@ def vm(encoded_sentence):
     return evaluate_postfix(postfix_tokens)
 
 
-
 def generate(depht_limit=2, max_number=10, operators=["+"], seed=0):
     """Infinite example generator"""
     import random
 
     prng = random.Random(seed)
 
-    MAX_NUMBER = 2**DATA_SIZE
+    MAX_NUMBER = 2**DATA_SIZE - 1
 
     def number():
-        return prng.randint(0, max(1, min(max_number, MAX_NUMBER)))
+        v = prng.randint(0, max(1, min(max_number, MAX_NUMBER // 4)))
+        return v
 
     def expression(depth):
         if depth >= depht_limit:
             return number()
 
-        selection = prng.choices(
-            ["bin", "parens", "number"],
-            [0.7, 0.0, 0.1]
-        )
+        selection = prng.choices(["bin", "parens", "number"], [0.7, 0.0, 0.1])
 
         match selection[0]:
             case "bin":
@@ -633,7 +653,99 @@ def generate(depht_limit=2, max_number=10, operators=["+"], seed=0):
             case _:
                 return f"{number()}"
 
-    return expression(0)
+    e = expression(0)
+    return e
+
+
+class Dataloader:
+    def __init__(self, dataset, batch_size=32, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            import random
+
+            random.shuffle(indices)
+
+        # Yield batches
+        for i in range(0, len(indices), self.batch_size):
+            batch_indices = indices[i : i + self.batch_size]
+            batch_data = [self.dataset[idx] for idx in batch_indices]
+
+            # Collate the batch: separate expressions, input_vectors, and target_vectors
+            expressions = []
+            input_batches = []
+            target_batches = []
+
+            for expr, input_vectors, target_vector in batch_data:
+                expressions.append(expr)
+                # Convert to tensors and move to device
+                input_tensor = torch.tensor(
+                    input_vectors, dtype=torch.float32, device=device
+                )
+                target_tensor = torch.tensor(
+                    target_vector, dtype=torch.float32, device=device
+                )
+                input_batches.append(input_tensor)
+                target_batches.append(target_tensor)
+
+            # Pad sequences to the same length within the batch
+            max_seq_len = max(len(inp) for inp in input_batches)
+
+            # Pad input sequences
+            padded_inputs = []
+            for inp in input_batches:
+                if len(inp) < max_seq_len:
+                    # Pad with zeros
+                    padding = torch.zeros(
+                        max_seq_len - len(inp), VECTOR_SIZE, device=device
+                    )
+                    padded_inp = torch.cat([inp, padding], dim=0)
+                else:
+                    padded_inp = inp
+                padded_inputs.append(padded_inp)
+
+            # Stack into batch tensors
+            input_batch = torch.stack(
+                padded_inputs
+            )  # [batch_size, max_seq_len, VECTOR_SIZE]
+            target_batch = torch.stack(target_batches)  # [batch_size, VECTOR_SIZE]
+
+            yield input_batch, target_batch
+
+    def __len__(self):
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+
+class GeneratedDataset:
+    def __init__(self, kind, n=10_000, **kwargs):
+        self.n = n
+        self.kind = kind
+        self.kwargs = kwargs
+
+    def __getitem__(self, i) -> (str, list[list[int]], list[int]):
+        expr = generate(seed=i, **self.kwargs)
+        encoded_input = encoder(expr)
+        target_value = vm(encoded_input)
+        encoded_target = encode(target_value)
+
+        match self.kind:
+            case "reproduce":
+                expr = f"{expr} = {target_value}"
+
+            case "complete":
+                expr = f"{expr} ="
+
+        input_vectors = [split_bits(i, VECTOR_SIZE) for i in encoder(expr)]
+        target_vector = split_bits(encoded_target, VECTOR_SIZE)
+
+        return expr, input_vectors, target_vector
+
+    def __len__(self):
+        return self.n
 
 
 for i in range(10):
@@ -645,7 +757,6 @@ for i in range(10):
     pyr = eval(expr)
 
     print(f"{expr:<50} = {result:3d} | {pyr:3d}")
-
 
 
 train_new_llm_two_phase()
@@ -664,5 +775,3 @@ for i in range(10):
     v1, v2 = unpack(new_llm_result)
 
     print(f"{expr:<50} = {result:3d} | {pyr:3d} | new_llm: {v1:3d} {v2}")
-
-
